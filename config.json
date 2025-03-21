@@ -1,0 +1,17 @@
+{
+    "database": {
+      "host": "127.0.0.1",
+      "port": 3306,
+      "username": "root",
+      "password": "",
+      "dbname": "db_omnirunner"
+    },
+    "rabbitmq": {
+      "host": "localhost",
+      "port": 5672,
+      "username": "guest",
+      "password": "guest",
+      "queue_name": "automation_queue"
+    }
+  }
+  
