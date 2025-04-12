@@ -3,130 +3,117 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
-	"time"
 
-	"consumer-test-runner/internal/config"
-	"consumer-test-runner/internal/infrastructure/messaging"
+	"github.com/streadway/amqp"
 )
 
-// AutomationPayload defines the expected payload structure.
-type AutomationPayload struct {
-	TestSuiteID string `json:"testsuite_id"`
+// AutomationRequest represents the incoming message format
+type AutomationRequest struct {
 	Project     string `json:"project"`
+	TestsuiteID string `json:"testsuite_id"`
+	TotalSteps  int    `json:"total_steps"`
+	Retries     int    `json:"retries"`
 }
 
 func main() {
-	// Load configuration from config.json.
-	cfg, err := config.LoadConfig()
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
-	}
-
-	// Connect to RabbitMQ using the dynamic configuration.
-	conn, channel, err := messaging.ConnectToRabbitMQ(cfg.RabbitMQ.AMQPURL())
-	if err != nil {
-		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+		log.Fatalf("Failed to connect to RabbitMQ: %s", err)
 	}
 	defer conn.Close()
-	// Declare the queue on the consumer channel to ensure it exists.
-	_, err = channel.QueueDeclare(
-		cfg.RabbitMQ.QueueName, // name
-		true,                   // durable
-		false,                  // autoDelete
-		false,                  // exclusive
-		false,                  // noWait
-		nil,                    // arguments
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("Failed to open a channel: %s", err)
+	}
+	defer ch.Close()
+
+	exchangeName := "automation"
+	err = ch.ExchangeDeclare(
+		exchangeName,
+		"fanout",
+		true,
+		false,
+		false,
+		false,
+		nil,
 	)
 	if err != nil {
-		log.Fatalf("Failed to declare queue: %v", err)
+		log.Fatalf("Failed to declare exchange: %s", err)
 	}
 
-	// Create a separate channel for publishing messages.
-	// pubChannel, err := conn.Channel()
-	// if err != nil {
-	// 	log.Fatalf("Failed to create publishing channel: %v", err)
-	// }
-	// defer pubChannel.Close()
-
-	// Create a publisher using the queue name from config.
-	publisher := messaging.NewRabbitMQPublisher(channel, cfg.RabbitMQ.QueueName)
-
-	// Set up a consumer on the same queue with manual acks.
-	msgs, err := channel.Consume(
-		cfg.RabbitMQ.QueueName, // queue
-		"",                     // consumer tag – let RabbitMQ generate one
-		false,                  // autoAck is false; we'll acknowledge manually
-		false,                  // exclusive
-		false,                  // no-local
-		false,                  // no-wait
-		nil,                    // args
+	q, err := ch.QueueDeclare(
+		"",
+		false,
+		true,
+		true,
+		false,
+		nil,
 	)
 	if err != nil {
-		log.Fatalf("Failed to register a consumer: %v", err)
+		log.Fatalf("Failed to declare queue: %s", err)
 	}
 
-	// Launch a goroutine to process incoming messages.
+	err = ch.QueueBind(q.Name, "", exchangeName, false, nil)
+	if err != nil {
+		log.Fatalf("Failed to bind queue: %s", err)
+	}
+
+	msgs, err := ch.Consume(
+		q.Name,
+		"",
+		true, // auto-ack
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("Failed to register consumer: %s", err)
+	}
+
+	fmt.Println("[*] Waiting for messages. To exit press CTRL+C")
+
+	forever := make(chan bool)
+
 	go func() {
 		for d := range msgs {
-			log.Printf("Received a message: %s", d.Body)
+			fmt.Printf("[x] Received: %s\n", d.Body)
 
-			// Unmarshal the message into AutomationPayload.
-			var payload AutomationPayload
-			if err := json.Unmarshal(d.Body, &payload); err != nil {
-				log.Printf("Error unmarshaling message: %v", err)
-				// Acknowledge the message even if there's an unmarshaling error.
-				d.Ack(false)
+			var req AutomationRequest
+			if err := json.Unmarshal(d.Body, &req); err != nil {
+				log.Printf("Failed to parse message: %v", err)
 				continue
 			}
 
-			// Marshal the payload to prepare the HTTP request.
-			reqBody, err := json.Marshal(payload)
+			err := handleRequest(req, ch, exchangeName, d.Body)
 			if err != nil {
-				log.Printf("Error marshaling payload: %v", err)
-				d.Ack(false)
-				continue
+				log.Printf("Error handling message: %v", err)
 			}
-
-			// Hit the endpoint.
-			resp, err := http.Post("http://localhost:6000/automation/run", "application/json", bytes.NewBuffer(reqBody))
-			if err != nil {
-				log.Printf("HTTP request error: %v", err)
-				// Reproduce the message to RabbitMQ.
-				republishMessage(publisher, d.Body)
-				d.Ack(false)
-				continue
-			}
-			// Close response body.
-			resp.Body.Close()
-
-			// Check if the status code is 200.
-			if resp.StatusCode != http.StatusOK {
-				log.Printf("HTTP response status not OK: %d", resp.StatusCode)
-				// Republish the message if not 200.
-				republishMessage(publisher, d.Body)
-			} else {
-				log.Printf("Message processed successfully")
-			}
-
-			// Acknowledge the original message.
-			d.Ack(false)
 		}
 	}()
 
-	log.Printf("Consumer is running. Waiting for messages...")
-	// Block forever.
-	select {}
+	<-forever
 }
 
-// republishMessage publishes the message back to RabbitMQ after a short delay.
-func republishMessage(publisher messaging.Publisher, body []byte) {
-	// Optional delay to avoid tight loops.
-	time.Sleep(2 * time.Second)
-	if err := publisher.Publish(body); err != nil {
-		log.Printf("Failed to republish message: %v", err)
-	} else {
-		log.Printf("Message reproduced to RabbitMQ")
+func handleRequest(data AutomationRequest, ch *amqp.Channel, exchangeName string, originalBody []byte) error {
+	bodyBytes, err := json.Marshal(data)
+	if err != nil {
+		return err
 	}
+
+	resp, err := http.Post("http://localhost:6000/automation/run", "application/json", bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("failed to send HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := ioutil.ReadAll(resp.Body)
+	fmt.Printf("[✓] Response : %s\n", respBody)
+
+	return nil
 }
